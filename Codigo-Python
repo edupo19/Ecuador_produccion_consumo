@@ -1,0 +1,176 @@
+import pandas as pd
+import re
+import os
+
+def detect_delimiter(file_path):
+    """Detecta automáticamente el delimitador adecuado (`;` o `,`) en el archivo."""
+    with open(file_path, 'r', encoding='latin1') as file:
+        first_line = file.readline()
+        if ',' in first_line and ';' not in first_line:
+            return ','
+        elif ';' in first_line and ',' not in first_line:
+            return ';'
+        else:
+            print("No se pudo determinar un delimitador claro. Usando ',' por defecto.")
+            return ','
+
+def extract_potencia_data_with_production_debug(file_path):
+    """
+    Extrae y procesa las columnas del archivo de entrada, devolviendo un DataFrame estructurado.
+    """
+    # Detectar el delimitador del archivo
+    delimiter = detect_delimiter(file_path)
+    print(f"Procesando archivo: {file_path}")
+    print(f"Usando delimitador detectado: '{delimiter}'")
+
+    try:
+        # Cargar el archivo con el delimitador detectado
+        data = pd.read_csv(file_path, encoding='latin1', header=None, delimiter=delimiter, on_bad_lines='skip', engine='python')
+    except Exception as e:
+        print(f"Error al leer el archivo: {e}")
+        return None
+
+    # Buscar mes y año en las primeras filas
+    month_year = {"Mes": "Desconocido", "Año": "Desconocido"}
+    try:
+        for i in range(min(3, len(data))):  # Limitar la búsqueda a las primeras tres filas
+            for cell in data.iloc[i, :]:
+                if pd.notna(cell) and isinstance(cell, str):
+                    match = re.search(r'([A-Z]+) (\d{4})', cell, re.IGNORECASE)
+                    if match:
+                        month_year["Mes"] = match.group(1).capitalize()
+                        month_year["Año"] = match.group(2)
+                        break
+            if month_year["Mes"] != "Desconocido" and month_year["Año"] != "Desconocido":
+                break
+    except Exception as e:
+        print(f"Error al detectar el mes y el año: {e}")
+
+    # Identificar las filas de inicio y fin para cada sección
+    def locate_section(keyword_start, keyword_end=None):
+        try:
+            start_row = data[0].str.contains(keyword_start, na=False).idxmax()
+            if keyword_end:
+                end_row = data[0].str.contains(keyword_end, na=False).idxmax()
+            else:
+                end_row = len(data)
+            return start_row, end_row
+        except Exception as e:
+            print(f"Error al localizar la sección '{keyword_start}': {e}")
+            return None, None
+
+    sections = {
+        "nominal": locate_section("1. Potencia Nominal en Generación", "2. Potencia Efectiva en Generación"),
+        "effective": locate_section("2. Potencia Efectiva en Generación", "3. Producción Total de Energía e Importaciones"),
+        "production": locate_section("3. Producción Total de Energía e Importaciones", "3.1 Producción Total de Energía e Importaciones S.N.I."),
+        "public_service": locate_section("4. Energía Entregada para Servicio Público", "5. Energía Disponible para Servicio Eléctrico"),
+    }
+
+    # Extraer datos de todas las secciones
+    def extract_data(start_row, end_row):
+        extracted_data = {}
+        current_category = None
+        if start_row is None or end_row is None:
+            return extracted_data
+
+        for i in range(start_row + 1, end_row):
+            if i >= len(data):
+                break
+            row = data.iloc[i]
+            try:
+                # Identificar y normalizar categorías
+                if pd.notna(row[0]) and isinstance(row[0], str):
+                    category = row[0].strip().lower()
+                    if category in ["renovable", "energía renovable"]:
+                        current_category = "Renovable"
+                    elif category == "no renovable":
+                        current_category = "No Renovable"
+                    elif category == "interconexiones":
+                        current_category = "Interconexiones"
+
+                # Extraer subcategoría y valores de potencia
+                if pd.notna(row[1]) and pd.notna(row[2]) and pd.notna(row[3]):
+                    subcategory = row[1]
+                    value_mw = float(row[2].replace('.', '').replace(',', '.'))
+                    value_percent = float(row[3].replace(',', '.').replace('%', ''))
+                    extracted_data[subcategory] = {
+                        "category": current_category,
+                        "value_mw": value_mw,
+                        "value_percent": value_percent,
+                    }
+            except (ValueError, IndexError) as e:
+                print(f"Error al procesar la fila {i}: {e}")
+                continue
+        return extracted_data
+
+    nominal_data = extract_data(*sections["nominal"])
+    effective_data = extract_data(*sections["effective"])
+    production_data = extract_data(*sections["production"])
+    public_service_data = extract_data(*sections["public_service"])
+
+    result = []
+    all_subcategories = set(nominal_data.keys()).union(set(effective_data.keys())).union(
+        set(production_data.keys())).union(set(public_service_data.keys()))
+    for subcategory in all_subcategories:
+        nominal = nominal_data.get(subcategory, {"category": None, "value_mw": None, "value_percent": None})
+        effective = effective_data.get(subcategory, {"category": None, "value_mw": None, "value_percent": None})
+        production = production_data.get(subcategory, {"category": None, "value_mw": None, "value_percent": None})
+        public_service = public_service_data.get(subcategory, {"category": None, "value_mw": None, "value_percent": None})
+        result.append({
+            "Energía Eléctrica (categoría)": nominal["category"] or effective["category"] or production["category"] or public_service["category"],
+            "Subcategoría": subcategory,
+            "1. Potencia Nominal en Generación (MW)": nominal["value_mw"],
+            "1. Potencia Nominal en Generación (%)": nominal["value_percent"],
+            "2. Potencia Efectiva en Generación (MW)": effective["value_mw"],
+            "2. Potencia Efectiva en Generación (%)": effective["value_percent"],
+            "Producción Total (GWh)": production["value_mw"],
+            "Producción Total (%)": production["value_percent"],
+            "Entregada a Servicio Público (GWh)": public_service["value_mw"],
+            "Entregada a Servicio Público (%)": public_service["value_percent"],
+            "Mes": month_year["Mes"],
+            "Año": month_year["Año"],
+        })
+
+    result_df = pd.DataFrame(result)
+    return result_df
+
+# Procesar todos los archivos
+folder_path = r"C:\UNIR\TFM\BNEE"
+unified_data = pd.DataFrame()
+
+for file_name in os.listdir(folder_path):
+    if file_name.endswith(".csv"):
+        file_path = os.path.join(folder_path, file_name)
+        df = extract_potencia_data_with_production_debug(file_path)
+        if df is not None:
+            unified_data = pd.concat([unified_data, df], ignore_index=True)
+
+# Ordenar categorías y subcategorías
+category_order = {"Renovable": 1, "No Renovable": 2, "Interconexiones": 3}
+subcategory_order = [
+    "Hidráulica", "Eólica", "Fotovoltaica", "Biomasa", "Biogas",
+    "Térmica MCI", "Térmica Turbogas", "Térmica Turbovapor", "Importación",
+    "Colombia", "Perú"
+]
+unified_data["category_order"] = unified_data["Energía Eléctrica (categoría)"].map(category_order)
+unified_data["subcategory_order"] = unified_data["Subcategoría"].apply(
+    lambda x: subcategory_order.index(x) if x in subcategory_order else float('inf')
+)
+
+# Ordenar meses
+month_order = [
+    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
+]
+unified_data["month_order"] = unified_data["Mes"].apply(
+    lambda x: month_order.index(x) if x in month_order else float('inf')
+)
+
+unified_data = unified_data.sort_values(
+    by=["Año", "month_order", "category_order", "subcategory_order"]
+).drop(columns=["category_order", "subcategory_order", "month_order"]).reset_index(drop=True)
+
+# Guardar el archivo unificado
+output_path = os.path.join(folder_path, "unified_data_ordered.csv")
+unified_data.to_csv(output_path, index=False, encoding='utf-8-sig')
+print(f"Archivo unificado y ordenado guardado en: {output_path}")
